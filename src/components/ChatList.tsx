@@ -14,6 +14,7 @@ type ChatListProps = {
   onOpenRecordDetail?: (record: RecordItem) => void;
   onOpenRecordSnapshot?: (record: RecordItem) => void;
   targetRecordUid?: string | null;
+  renderAfterRecord?: (record: RecordItem) => React.ReactNode;
 };
 
 // 获取交错动画延迟类名
@@ -31,6 +32,7 @@ export default function ChatList({
   onOpenRecordDetail,
   onOpenRecordSnapshot,
   targetRecordUid,
+  renderAfterRecord,
 }: ChatListProps) {
   const { resolvedLocale, t } = usePreferences();
   const topRef = useRef<HTMLDivElement>(null);
@@ -175,6 +177,7 @@ export default function ChatList({
                 : undefined
             }
           />
+          {renderAfterRecord?.(record)}
         </div>
       );
 

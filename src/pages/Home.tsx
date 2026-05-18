@@ -5,9 +5,17 @@ import ChatInput from "@/components/ChatInput";
 import ChatList from "@/components/ChatList";
 import RecordDetailSheet from "@/components/RecordDetailSheet";
 import RecordFullDetailScreen from "@/components/RecordFullDetailScreen";
+import Arrangements from "@/pages/Arrangements";
 import Records from "@/pages/Records";
 import { aiConversationLogEntries } from "@/data/aiConversationLog";
 import { useCandidateProfile } from "@/data/candidateProfile";
+import {
+  arrangementAiApiKeyStorageKey,
+  defaultArrangementAiModel,
+  extractArrangementsFromMessages,
+  type ArrangementAiCandidate,
+  type ArrangementAiMessage,
+} from "@/services/arrangementAi";
 import {
   createTestReplyMessage,
   demoSenderIdentityId,
@@ -57,6 +65,7 @@ type TabItem = {
 
 const tabs: TabItem[] = [
   { key: "records" },
+  { key: "arrangements" },
   { key: "insight" },
   { key: "mine" },
 ];
@@ -64,6 +73,10 @@ const tabs: TabItem[] = [
 const aiConversationReadCountStorageKey = "arkme-demo.aiConversationReadCount";
 const browserNotificationPromptedStorageKey = "arkme-demo.browserNotificationPrompted";
 const createdSelfRecordsStorageKey = "arkme-demo.selfRecords";
+const arrangementsStorageKey = "arkme-demo.arrangements";
+const groupArrangementCapsuleStateKey = "arkme-demo.groupArrangementCapsules";
+const arrangementCapsuleDecisionStorageKey = "arkme-demo.arrangementCapsuleDecisions";
+const arrangementCapsuleDecisionEvent = "arkme-demo:arrangement-capsule-decisions";
 const searchHistoryStorageKey = "arkme-demo.searchHistory";
 const aiConversationTotalCount = aiConversationLogEntries.length;
 const maxSearchHistoryCount = 4;
@@ -97,6 +110,22 @@ type TestConversationSummary = {
 type TestConversationRecord = RecordItem & {
   sender: TestMessageSender;
   identityId: string;
+};
+
+type SmartArrangementCapsule = {
+  id: string;
+  recordUid: string;
+  title: string;
+  timeLabel: string;
+  mode: "auto" | "suggestion" | "private";
+  confidence?: number;
+  reason?: string;
+};
+
+type StoredArrangementLike = {
+  id?: unknown;
+  sourceMessageIds?: unknown;
+  contextMessages?: unknown;
 };
 
 type HomeMessagePreview = {
@@ -236,6 +265,382 @@ function persistCreatedSelfRecords(records: RecordItem[]) {
   }
 }
 
+function readCapsuleState() {
+  if (typeof window === "undefined") return {};
+
+  try {
+    const storedValue = window.localStorage.getItem(groupArrangementCapsuleStateKey);
+    if (!storedValue) return {};
+    const parsedValue = JSON.parse(storedValue);
+    return parsedValue && typeof parsedValue === "object" && !Array.isArray(parsedValue)
+      ? (parsedValue as Record<string, "added" | "dismissed">)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistCapsuleState(state: Record<string, "added" | "dismissed">) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(groupArrangementCapsuleStateKey, JSON.stringify(state));
+}
+
+function normalizeStoredCapsuleDecision(value: unknown): SmartArrangementCapsule | null {
+  if (!value || typeof value !== "object") return null;
+
+  const capsule = value as Partial<SmartArrangementCapsule>;
+  if (
+    typeof capsule.id !== "string" ||
+    typeof capsule.recordUid !== "string" ||
+    typeof capsule.title !== "string" ||
+    typeof capsule.timeLabel !== "string" ||
+    (capsule.mode !== "auto" && capsule.mode !== "suggestion" && capsule.mode !== "private")
+  ) {
+    return null;
+  }
+
+  return {
+    id: capsule.id,
+    recordUid: capsule.recordUid,
+    title: capsule.title,
+    timeLabel: capsule.timeLabel,
+    mode: capsule.mode,
+    ...(typeof capsule.confidence === "number" ? { confidence: capsule.confidence } : {}),
+    ...(typeof capsule.reason === "string" ? { reason: capsule.reason } : {}),
+  };
+}
+
+function readCapsuleDecisions() {
+  if (typeof window === "undefined") return {};
+
+  try {
+    const storedValue = window.localStorage.getItem(arrangementCapsuleDecisionStorageKey);
+    if (!storedValue) return {};
+    const parsedValue = JSON.parse(storedValue);
+    if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
+      return {};
+    }
+
+    return Object.entries(parsedValue).reduce<Record<string, SmartArrangementCapsule>>(
+      (result, [recordUid, value]) => {
+        const capsule = normalizeStoredCapsuleDecision(value);
+        return capsule ? { ...result, [recordUid]: capsule } : result;
+      },
+      {}
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistCapsuleDecisions(decisions: Record<string, SmartArrangementCapsule>) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(arrangementCapsuleDecisionStorageKey, JSON.stringify(decisions));
+  window.dispatchEvent(new Event(arrangementCapsuleDecisionEvent));
+}
+
+function readStoredArrangements(): StoredArrangementLike[] {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(arrangementsStorageKey);
+    if (!storedValue) return [];
+
+    const parsedValue = JSON.parse(storedValue);
+    return Array.isArray(parsedValue) ? (parsedValue as StoredArrangementLike[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function arrangementHasSourceMessage(item: StoredArrangementLike, recordUid: string) {
+  const sourceMessageIds = Array.isArray(item.sourceMessageIds)
+    ? item.sourceMessageIds
+    : [];
+  const contextMessages = Array.isArray(item.contextMessages)
+    ? item.contextMessages
+    : [];
+
+  return (
+    String(item.id ?? "").includes(recordUid) ||
+    sourceMessageIds.includes(recordUid) ||
+    contextMessages.some((message) => {
+      if (!message || typeof message !== "object") return false;
+      return (message as { id?: unknown }).id === recordUid;
+    })
+  );
+}
+
+function storeArrangementIfMissing(recordUid: string | string[], nextItem: StoredArrangementLike) {
+  if (typeof window === "undefined") return;
+
+  const recordUids = Array.isArray(recordUid) ? recordUid : [recordUid];
+  const currentItems = readStoredArrangements();
+  if (
+    currentItems.some((item) =>
+      recordUids.some((uid) => arrangementHasSourceMessage(item, uid))
+    )
+  ) {
+    return;
+  }
+
+  window.localStorage.setItem(
+    arrangementsStorageKey,
+    JSON.stringify([nextItem, ...currentItems])
+  );
+}
+
+function getStoredArrangementAiApiKey() {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(arrangementAiApiKeyStorageKey)?.trim() ?? "";
+}
+
+function storeArrangementAiCandidate(candidate: ArrangementAiCandidate, createdAt: number) {
+  const sourceMessageIds = candidate.contextMessages.map((message) => message.id);
+  if (sourceMessageIds.length === 0) return;
+
+  const nextItem = {
+    id: `arrangement-ai-live-${candidate.id}-${createdAt}`,
+    title: candidate.title,
+    note: candidate.note,
+    timeKind: candidate.timeKind,
+    dueAt: candidate.dueAt,
+    endAt: candidate.endAt,
+    weakTimeLabel: candidate.weakTimeLabel,
+    location: candidate.location,
+    people: candidate.people,
+    status: "active",
+    source: candidate.source,
+    sourceMessageIds,
+    createdAt,
+    updatedAt: createdAt,
+    contextMessages: candidate.contextMessages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      sentAt: message.sentAt,
+      source: message.source,
+    })),
+    timeline: [
+      {
+        id: `life-ai-live-${candidate.id}-${createdAt}`,
+        label: "AI自动识别",
+        detail: candidate.reason,
+        at: createdAt,
+      },
+    ],
+  };
+
+  storeArrangementIfMissing(sourceMessageIds, nextItem);
+}
+
+function formatCapsuleTimeLabel(candidate: ArrangementAiCandidate) {
+  if (candidate.timeKind === "weak") return candidate.weakTimeLabel || "待定";
+  if (!candidate.dueAt) return candidate.weakTimeLabel || "待定";
+
+  const date = new Date(candidate.dueAt);
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const isTomorrow =
+    date.getFullYear() === tomorrow.getFullYear() &&
+    date.getMonth() === tomorrow.getMonth() &&
+    date.getDate() === tomorrow.getDate();
+  const dateLabel = isTomorrow ? "明天" : `${date.getMonth() + 1}月${date.getDate()}日`;
+  const timeLabel = `${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes()
+  ).padStart(2, "0")}`;
+
+  return `${dateLabel} ${timeLabel}`;
+}
+
+function buildCapsuleFromAiCandidate(
+  candidate: ArrangementAiCandidate,
+  recordUid: string
+): SmartArrangementCapsule {
+  return {
+    id: `ai-capsule-${recordUid}`,
+    recordUid,
+    title: candidate.title,
+    timeLabel: formatCapsuleTimeLabel(candidate),
+    mode: candidate.capsuleMode,
+    confidence: candidate.confidence,
+    reason: candidate.reason,
+  };
+}
+
+function storeCapsuleDecisionFromAiCandidate(candidate: ArrangementAiCandidate) {
+  if (candidate.confidence < 0.58) return;
+
+  const sourceMessageIds = candidate.contextMessages.map((message) => message.id);
+  if (sourceMessageIds.length === 0) return;
+
+  const currentDecisions = readCapsuleDecisions();
+  const currentState = readCapsuleState();
+  const nextDecisions = { ...currentDecisions };
+  const nextState = { ...currentState };
+
+  sourceMessageIds.forEach((recordUid) => {
+    const capsule = buildCapsuleFromAiCandidate(candidate, recordUid);
+    nextDecisions[recordUid] = capsule;
+    if (candidate.confidence >= 0.72 && capsule.mode !== "suggestion") {
+      nextState[capsule.id] = "added";
+    }
+  });
+
+  persistCapsuleState(nextState);
+  persistCapsuleDecisions(nextDecisions);
+}
+
+async function recognizeLiveArrangementWindow(messages: ArrangementAiMessage[]) {
+  const apiKey = getStoredArrangementAiApiKey();
+  const cleanMessages = messages.filter((message) => message.content.trim()).slice(-8);
+  if (!apiKey || cleanMessages.length === 0) return;
+
+  try {
+    const result = await extractArrangementsFromMessages(cleanMessages, {
+      apiKey,
+      model: defaultArrangementAiModel,
+    });
+    const currentTime = Date.now();
+    result.candidates.forEach((candidate, index) => {
+      storeCapsuleDecisionFromAiCandidate(candidate);
+      if (candidate.confidence >= 0.72 && candidate.capsuleMode !== "suggestion") {
+        storeArrangementAiCandidate(candidate, currentTime + index);
+      }
+    });
+  } catch {
+    // Chat sending should stay non-blocking when live AI is unavailable.
+  }
+}
+
+function addCapsuleArrangement(capsule: SmartArrangementCapsule, record: TestConversationRecord, summary: TestConversationSummary) {
+  if (typeof window === "undefined") return;
+
+  const currentTime = Date.now();
+  const dueAt = capsule.timeLabel.includes("15:00")
+    ? new Date(new Date().setDate(new Date().getDate() + 1)).setHours(15, 0, 0, 0)
+    : null;
+  const nextItem = {
+    id: `arrangement-capsule-${record.uid}-${currentTime}`,
+    title: capsule.timeLabel === "待定" ? capsule.title : `${capsule.timeLabel} ${capsule.title}`,
+    note: "来自聊天流智能胶囊。",
+    timeKind: dueAt ? "strong" : "weak",
+    dueAt,
+    endAt: null,
+    weakTimeLabel: dueAt ? "" : capsule.timeLabel,
+    location: "",
+    people: summary.title,
+    status: "active",
+    source: summary.conversationType === "group" ? "group" : "private",
+    sourceMessageIds: [record.uid],
+    createdAt: currentTime,
+    updatedAt: currentTime,
+    contextMessages: [
+      {
+        id: record.uid,
+        role: summary.title,
+        content: record.text_content,
+        sentAt: record.send_at,
+        source: summary.conversationType === "group" ? "group" : "private",
+      },
+    ],
+    timeline: [
+      {
+        id: `life-capsule-${record.uid}-${currentTime}`,
+        label: "智能胶囊加入",
+        detail: "从聊天流中的安排提示加入。",
+        at: currentTime,
+      },
+    ],
+  };
+
+  storeArrangementIfMissing(record.uid, nextItem);
+}
+
+function removeCapsuleArrangement(recordUid: string) {
+  if (typeof window === "undefined") return;
+
+  const storedValue = window.localStorage.getItem(arrangementsStorageKey);
+  if (!storedValue) return;
+  const currentItems = JSON.parse(storedValue) as StoredArrangementLike[];
+  if (!Array.isArray(currentItems)) return;
+  window.localStorage.setItem(
+    arrangementsStorageKey,
+    JSON.stringify(
+      currentItems.filter((item) => !arrangementHasSourceMessage(item, recordUid))
+    )
+  );
+}
+
+function addSelfCapsuleArrangement(capsule: SmartArrangementCapsule, record: RecordItem, selfName: string) {
+  if (typeof window === "undefined") return;
+
+  const currentTime = Date.now();
+  const nextItem = {
+    id: `arrangement-capsule-${record.uid}-${currentTime}`,
+    title: capsule.timeLabel === "待定" ? capsule.title : `${capsule.timeLabel} ${capsule.title}`,
+    note: "来自发给自己的智能胶囊。",
+    timeKind: "weak",
+    dueAt: null,
+    endAt: null,
+    weakTimeLabel: capsule.timeLabel,
+    location: "",
+    people: selfName,
+    status: "active",
+    source: "self",
+    sourceMessageIds: [record.uid],
+    createdAt: currentTime,
+    updatedAt: currentTime,
+    contextMessages: [
+      {
+        id: record.uid,
+        role: selfName,
+        content: record.text_content,
+        sentAt: record.send_at,
+        source: "self",
+      },
+    ],
+    timeline: [
+      {
+        id: `life-self-capsule-${record.uid}-${currentTime}`,
+        label: "发给自己胶囊加入",
+        detail: "从发给自己的消息流中记录。",
+        at: currentTime,
+      },
+    ],
+  };
+
+  storeArrangementIfMissing(record.uid, nextItem);
+}
+
+function selfRecordToAiMessage(record: RecordItem, selfName: string): ArrangementAiMessage {
+  return {
+    id: record.uid,
+    role: selfName,
+    content: record.text_content,
+    sentAt: record.send_at,
+    source: "self",
+  };
+}
+
+function testRecordToAiMessage(
+  record: TestConversationRecord,
+  summary: TestConversationSummary,
+  selfName: string
+): ArrangementAiMessage {
+  const identityName =
+    summary.memberIdentities.find((identity) => identity.id === record.identityId)?.name ??
+    summary.title;
+
+  return {
+    id: record.uid,
+    role: record.sender === "demo" ? selfName : identityName,
+    content: record.text_content,
+    sentAt: record.send_at,
+    source: summary.conversationType,
+  };
+}
+
 function makeRecordReference(record: RecordItem): RecordReference {
   return {
     uid: record.uid,
@@ -329,6 +734,8 @@ function shouldRequestBrowserNotificationPermission() {
 
 export default function Home({ currentPage, onNavigate }: HomeProps) {
   const { t } = usePreferences();
+  const candidateProfile = useCandidateProfile();
+  const arrangementSelfDisplayName = candidateProfile?.name || t("recordDetail.me");
   const [showSearch, setShowSearch] = React.useState(false);
   const [showMenu, setShowMenu] = React.useState(false);
   const [showAnswerGuide, setShowAnswerGuide] = React.useState(false);
@@ -697,6 +1104,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     (total, summary) => total + summary.unreadCount,
     0
   );
+
   const homeMessagePreview = React.useMemo<HomeMessagePreview | null>(
     () =>
       testConversationSummaries.reduce<HomeMessagePreview | null>(
@@ -759,21 +1167,24 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
 
   const createSelfRecord = React.useCallback((content: string) => {
     const timestamp = Date.now();
+    const nextRecord: RecordItem = {
+      uid: `self-${timestamp}`,
+      text_content: content,
+      send_at: timestamp,
+      create_at: timestamp,
+      update_at: timestamp,
+    };
+
     setCreatedSelfRecords((prev) => {
-      const nextRecords = [
-        ...prev,
-        {
-          uid: `self-${timestamp}`,
-          text_content: content,
-          send_at: timestamp,
-          create_at: timestamp,
-          update_at: timestamp,
-        },
-      ];
+      const nextRecords = [...prev, nextRecord];
       persistCreatedSelfRecords(nextRecords);
       return nextRecords;
     });
-  }, []);
+    void recognizeLiveArrangementWindow([
+      ...selfRecords.map((record) => selfRecordToAiMessage(record, arrangementSelfDisplayName)),
+      selfRecordToAiMessage(nextRecord, arrangementSelfDisplayName),
+    ]);
+  }, [arrangementSelfDisplayName, selfRecords]);
 
   const createRecordExtension = React.useCallback((parentRecord: RecordItem, content: string) => {
     const timestamp = Date.now();
@@ -1029,6 +1440,15 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       content,
       summary.conversationType
     );
+    const replyRecord: TestConversationRecord = {
+      uid: `test-${reply.id}`,
+      text_content: reply.text,
+      send_at: reply.sentAt,
+      create_at: reply.sentAt,
+      update_at: reply.sentAt,
+      sender: reply.sender,
+      identityId: reply.identityId,
+    };
     setTestMessages((prev) => {
       const nextMessages = [...prev, reply];
       persistTestMessages(nextMessages);
@@ -1036,7 +1456,13 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     });
     markTestConversationAsRead(summary.conversationId);
     setTestConversationTargetUid(`test-${reply.id}`);
-  }, [markTestConversationAsRead]);
+    void recognizeLiveArrangementWindow([
+      ...summary.records.map((record) =>
+        testRecordToAiMessage(record, summary, arrangementSelfDisplayName)
+      ),
+      testRecordToAiMessage(replyRecord, summary, arrangementSelfDisplayName),
+    ]);
+  }, [arrangementSelfDisplayName, markTestConversationAsRead]);
 
   const openSourceConversation = React.useCallback(
     (source: RecordSourceConversation) => {
@@ -1174,6 +1600,10 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <InsightPreview />;
     }
 
+    if (currentPage === "arrangements") {
+      return <Arrangements />;
+    }
+
     return (
       <div className="flex h-full flex-col bg-bg">
         <MobileHeader
@@ -1206,8 +1636,8 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   return (
     <AppShell
       mainPane={
-        <div className="relative flex min-h-0 flex-1 flex-col">
-          <main className="min-h-0 flex-1 overflow-hidden">{renderMainContent()}</main>
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+          <main className="min-h-0 min-w-0 flex-1 overflow-hidden">{renderMainContent()}</main>
           {!recordDetail && !showSearch && !showAnswerGuide && !showAiConversation && !showSendToSelf && !showTestConversation && !settingsView && (
             <MobileBottomNavigation currentPage={currentPage} onNavigate={onNavigate} />
           )}
@@ -2323,10 +2753,46 @@ function SendToSelfConversationChat({
   onOpenRecordSnapshot: (record: RecordItem) => void;
 }) {
   const { t } = usePreferences();
+  const candidateProfile = useCandidateProfile();
+  const selfDisplayName = candidateProfile?.name || t("recordDetail.me");
+  const [capsuleState, setCapsuleState] = React.useState(readCapsuleState);
+  const [capsuleDecisions, setCapsuleDecisions] = React.useState(readCapsuleDecisions);
   const recordsWithoutSource = React.useMemo(
     () => records.map(({ sourceConversation: _sourceConversation, ...record }) => record),
     [records]
   );
+  const sourceRecordByUid = React.useMemo(
+    () => new Map(records.map((record) => [record.uid, record])),
+    [records]
+  );
+
+  const updateCapsuleState = (capsuleId: string, state: "added" | "dismissed") => {
+    setCapsuleState((current) => {
+      const nextState = { ...current, [capsuleId]: state };
+      persistCapsuleState(nextState);
+      return nextState;
+    });
+  };
+
+  const handleAddSelfCapsule = (capsule: SmartArrangementCapsule, record: RecordItem) => {
+    addSelfCapsuleArrangement(capsule, record, selfDisplayName);
+    updateCapsuleState(capsule.id, "added");
+  };
+
+  const handleUndoSelfCapsule = (capsule: SmartArrangementCapsule) => {
+    removeCapsuleArrangement(capsule.recordUid);
+    updateCapsuleState(capsule.id, "dismissed");
+  };
+
+  React.useEffect(() => {
+    const syncCapsuleDecisions = () => setCapsuleDecisions(readCapsuleDecisions());
+    window.addEventListener(arrangementCapsuleDecisionEvent, syncCapsuleDecisions);
+    window.addEventListener("storage", syncCapsuleDecisions);
+    return () => {
+      window.removeEventListener(arrangementCapsuleDecisionEvent, syncCapsuleDecisions);
+      window.removeEventListener("storage", syncCapsuleDecisions);
+    };
+  }, []);
 
   return (
     <div className="flex h-full flex-col bg-bg">
@@ -2365,6 +2831,18 @@ function SendToSelfConversationChat({
         targetRecordUid={targetUid}
         onOpenRecordDetail={onOpenRecordDetail}
         onOpenRecordSnapshot={onOpenRecordSnapshot}
+        renderAfterRecord={(record) => {
+          const sourceRecord = sourceRecordByUid.get(record.uid) ?? record;
+          return (
+              <SmartArrangementCapsuleView
+              capsule={capsuleDecisions[sourceRecord.uid] ?? null}
+              state={capsuleState}
+              align="right"
+              onAdd={(capsule) => handleAddSelfCapsule(capsule, sourceRecord)}
+              onUndo={handleUndoSelfCapsule}
+            />
+          );
+        }}
       />
       <ChatInput
         onSubmit={onCreateRecord}
@@ -2394,10 +2872,40 @@ function TestIdentityConversationChat({
   const selfDisplayName = candidateProfile?.name || t("recordDetail.me");
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
   const recordRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
+  const [capsuleState, setCapsuleState] = React.useState(readCapsuleState);
+  const [capsuleDecisions, setCapsuleDecisions] = React.useState(readCapsuleDecisions);
   const sortedRecords = React.useMemo(
     () => [...summary.records].sort((a, b) => a.send_at - b.send_at),
     [summary.records]
   );
+
+  const updateCapsuleState = (capsuleId: string, state: "added" | "dismissed") => {
+    setCapsuleState((current) => {
+      const nextState = { ...current, [capsuleId]: state };
+      persistCapsuleState(nextState);
+      return nextState;
+    });
+  };
+
+  const handleAddCapsule = (capsule: SmartArrangementCapsule, record: TestConversationRecord) => {
+    addCapsuleArrangement(capsule, record, summary);
+    updateCapsuleState(capsule.id, "added");
+  };
+
+  const handleUndoCapsule = (capsule: SmartArrangementCapsule) => {
+    removeCapsuleArrangement(capsule.recordUid);
+    updateCapsuleState(capsule.id, "dismissed");
+  };
+
+  React.useEffect(() => {
+    const syncCapsuleDecisions = () => setCapsuleDecisions(readCapsuleDecisions());
+    window.addEventListener(arrangementCapsuleDecisionEvent, syncCapsuleDecisions);
+    window.addEventListener("storage", syncCapsuleDecisions);
+    return () => {
+      window.removeEventListener(arrangementCapsuleDecisionEvent, syncCapsuleDecisions);
+      window.removeEventListener("storage", syncCapsuleDecisions);
+    };
+  }, []);
 
   React.useLayoutEffect(() => {
     const container = scrollContainerRef.current;
@@ -2487,6 +2995,13 @@ function TestIdentityConversationChat({
                       onOpenDetail={() => onOpenRecordDetail(record)}
                       onOpenMemorySnapshot={() => onOpenRecordSnapshot(record)}
                     />
+                    <SmartArrangementCapsuleView
+                      capsule={capsuleDecisions[record.uid] ?? null}
+                      state={capsuleState}
+                      align="right"
+                      onAdd={(capsule) => handleAddCapsule(capsule, record)}
+                      onUndo={handleUndoCapsule}
+                    />
                   </div>
                 ) : (
                   <div className="flex items-start gap-2.5">
@@ -2511,6 +3026,13 @@ function TestIdentityConversationChat({
                           {record.text_content}
                         </p>
                       </button>
+                      <SmartArrangementCapsuleView
+                        capsule={capsuleDecisions[record.uid] ?? null}
+                        state={capsuleState}
+                        align="left"
+                        onAdd={(capsule) => handleAddCapsule(capsule, record)}
+                        onUndo={handleUndoCapsule}
+                      />
                     </div>
                   </div>
                 )}
@@ -2529,6 +3051,59 @@ function TestIdentityConversationChat({
 
 function shouldShowConversationTime(prevSendAt: number, currentSendAt: number) {
   return Math.abs(currentSendAt - prevSendAt) > 1000 * 60 * 5;
+}
+
+function SmartArrangementCapsuleView({
+  capsule,
+  state,
+  align,
+  onAdd,
+  onUndo,
+}: {
+  capsule: SmartArrangementCapsule | null;
+  state: Record<string, "added" | "dismissed">;
+  align: "left" | "right";
+  onAdd: (capsule: SmartArrangementCapsule) => void;
+  onUndo: (capsule: SmartArrangementCapsule) => void;
+}) {
+  if (!capsule || state[capsule.id] === "dismissed") return null;
+
+  const added = state[capsule.id] === "added" || capsule.mode === "auto" || capsule.mode === "private";
+  const label = added
+    ? `✨ ${capsule.timeLabel} ${capsule.title}（已记录）`
+    : `✨ ${capsule.title} · ${capsule.timeLabel}`;
+
+  return (
+    <div className={cn("mt-1.5 flex", align === "right" ? "justify-end pr-4" : "justify-start")}>
+      <div
+        className={cn(
+          "inline-flex max-w-[86%] items-center gap-2 rounded-full px-2.5 py-1 text-[11px] leading-4",
+          added
+            ? "bg-primary-soft text-primary"
+            : "bg-fill-3 text-text-tertiary"
+        )}
+      >
+        <span className="min-w-0 truncate">{label}</span>
+        {added ? (
+          <button
+            type="button"
+            onClick={() => onUndo(capsule)}
+            className="shrink-0 rounded-full px-1 text-[10px] text-text-tertiary transition hover:text-text"
+          >
+            撤销
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onAdd(capsule)}
+            className="shrink-0 rounded-full bg-primary px-2 py-0.5 text-[10px] font-medium text-on-primary transition active:scale-[0.96]"
+          >
+            + 加入
+          </button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function TestIdentityAvatar({
@@ -2691,7 +3266,7 @@ function MobileBottomNavigation({
               type="button"
               onClick={() => onNavigate(tab.key)}
               className={cn(
-                "flex h-full flex-1 items-center justify-center rounded-[10px] text-base transition active:scale-[0.98]",
+                "flex h-full min-w-0 flex-1 items-center justify-center rounded-[10px] text-[15px] transition active:scale-[0.98]",
                 active
                   ? "font-semibold text-text"
                   : "font-normal text-text-tertiary"
@@ -3430,6 +4005,7 @@ function ThemePreview({ mode }: { mode: ResolvedTheme }) {
 
 function getTabLabel(page: PageType, t: ReturnType<typeof usePreferences>["t"]) {
   if (page === "records") return t("tabs.records");
+  if (page === "arrangements") return "安排";
   if (page === "insight") return t("tabs.insight");
   return t("tabs.mine");
 }
