@@ -38,10 +38,12 @@ export type ArrangementAiProviderOptions = {
   apiKey?: string;
   model?: string;
   useMock?: boolean;
+  userName?: string;
 };
 
 export const arrangementAiApiKeyStorageKey = "arkme-demo.deepseekApiKey";
-export const defaultArrangementAiModel = "deepseek-v4-flash";
+export const arrangementAiLastStatusStorageKey = "arkme-demo.arrangementAiLastStatus";
+export const defaultArrangementAiModel = "deepseek-chat";
 
 const hour = 1000 * 60 * 60;
 const minute = 1000 * 60;
@@ -180,7 +182,7 @@ async function extractArrangementsWithDeepSeek(
   options: ArrangementAiProviderOptions
 ): Promise<ArrangementAiExtractionResult> {
   const currentTime = Date.now();
-  const response = await fetch("https://api.deepseek.com/chat/completions", {
+  const response = await fetch("/api/deepseek/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -193,11 +195,11 @@ async function extractArrangementsWithDeepSeek(
         {
           role: "system",
           content:
-            "你是一个安排识别器。只从对话中抽取和用户本人后续行动相关的安排。连续补充同一目标的消息要合并；动作、地点、时间或目标不同的事项要拆分。群聊中只有明确 @ 用户、管理员分配给用户、或用户回复认领的事项才归到用户名下。只输出 JSON，不要输出 Markdown。",
+            "You are an arrangement extraction engine. Return JSON only, no Markdown. For self notes and private chats, extract clear arrangements for the user. In group chats, tasks explicitly @ mentioning the user, assigned to the user, or claimed by the user should use capsuleMode=auto. Public group reminders, all-member tasks, and announcement-like tasks should also be extracted, but must use capsuleMode=suggestion so they show a suggestion capsule and are not auto-added. Merge continuous additions to the same goal; split items with different action, place, time, or goal.",
         },
         {
           role: "user",
-          content: buildDeepSeekExtractionPrompt(currentTime, messages),
+          content: buildDeepSeekExtractionPrompt(currentTime, messages, options.userName),
         },
       ],
     }),
@@ -222,7 +224,11 @@ async function extractArrangementsWithDeepSeek(
   };
 }
 
-function buildDeepSeekExtractionPrompt(currentTime: number, messages: ArrangementAiMessage[]) {
+function buildDeepSeekExtractionPrompt(
+  currentTime: number,
+  messages: ArrangementAiMessage[],
+  userName = "Mao Yuanliang"
+) {
   return JSON.stringify({
     task: "extract_arrangements",
     outputSchema: {
@@ -247,20 +253,22 @@ function buildDeepSeekExtractionPrompt(currentTime: number, messages: Arrangemen
       ],
     },
     rules: [
-      "强时间表示有明确 DDL、具体时刻或时间段；弱时间表示只有大致时间或待定。",
-      "同一段连续对话里围绕同一目标追加的信息要合并为同一条安排。",
-      "动作、地点、时间或目标不同的事项要拆分为不同安排。",
-      "群聊只抽取和毛远亮本人相关的安排：被 @、被指派、或本人明确认领。",
-      "capsuleMode 决定聊天流胶囊交互：明确属于用户且应自动并入用 auto；私聊或发给自己的明确安排用 private；群内公开任务或不确定是否需要用户执行但值得提示时用 suggestion。",
-      "如果没有安排，返回 candidates: []。",
+      "Strong time means an explicit deadline, exact time, or time range. Weak time means vague timing or pending timing.",
+      "Merge consecutive messages that add details to the same goal into one arrangement.",
+      "Split items when action, place, time, or goal is different.",
+      "For self notes or private chats, clear arrangements should use capsuleMode=private and may be auto-added when confidence is high.",
+      "For group chats, if the user is explicitly mentioned, assigned, or claims the task, use capsuleMode=auto and it may be auto-added when confidence is high.",
+      "For public group reminders, all-member tasks, or announcement-like tasks, extract them with capsuleMode=suggestion only. They should show a + add suggestion and must not be auto-added.",
+      "If the user posts a public reminder to everyone in a group, treat it as group suggestion unless the user is personally committing to do it.",
+      "If an earlier group message proposes an unclaimed task and a later user message claims it, such as 'I have it', 'I can do it', or 'leave it to me', link both messages into one arrangement. contextMessages must include at least the original task and the claim message.",
+      "If there are no arrangements, return candidates: [].",
     ],
     now: new Date(currentTime).toISOString(),
     timezone: "Asia/Shanghai",
-    userName: "毛远亮",
+    userName,
     messages,
   });
 }
-
 function extractDeepSeekResponseText(payload: unknown) {
   if (!payload || typeof payload !== "object") {
     throw new Error("DeepSeek API 返回为空。");

@@ -7,6 +7,15 @@ const rootDir = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
+  server: {
+    proxy: {
+      "/api/deepseek": {
+        target: "https://api.deepseek.com",
+        changeOrigin: true,
+        rewrite: (pathName) => pathName.replace(/^\/api\/deepseek/, ""),
+      },
+    },
+  },
   resolve: {
     alias: {
       "@": resolve(rootDir, "src"),

@@ -11,6 +11,7 @@ import { aiConversationLogEntries } from "@/data/aiConversationLog";
 import { useCandidateProfile } from "@/data/candidateProfile";
 import {
   arrangementAiApiKeyStorageKey,
+  arrangementAiLastStatusStorageKey,
   defaultArrangementAiModel,
   extractArrangementsFromMessages,
   type ArrangementAiCandidate,
@@ -77,6 +78,7 @@ const arrangementsStorageKey = "arkme-demo.arrangements";
 const groupArrangementCapsuleStateKey = "arkme-demo.groupArrangementCapsules";
 const arrangementCapsuleDecisionStorageKey = "arkme-demo.arrangementCapsuleDecisions";
 const arrangementCapsuleDecisionEvent = "arkme-demo:arrangement-capsule-decisions";
+const arrangementAiStatusEvent = "arkme-demo:arrangement-ai-status";
 const searchHistoryStorageKey = "arkme-demo.searchHistory";
 const aiConversationTotalCount = aiConversationLogEntries.length;
 const maxSearchHistoryCount = 4;
@@ -395,6 +397,12 @@ function getStoredArrangementAiApiKey() {
   return window.localStorage.getItem(arrangementAiApiKeyStorageKey)?.trim() ?? "";
 }
 
+function writeArrangementAiStatus(status: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(arrangementAiLastStatusStorageKey, status);
+  window.dispatchEvent(new Event(arrangementAiStatusEvent));
+}
+
 function storeArrangementAiCandidate(candidate: ArrangementAiCandidate, createdAt: number) {
   const sourceMessageIds = candidate.contextMessages.map((message) => message.id);
   if (sourceMessageIds.length === 0) return;
@@ -491,15 +499,23 @@ function storeCapsuleDecisionFromAiCandidate(candidate: ArrangementAiCandidate) 
   persistCapsuleDecisions(nextDecisions);
 }
 
-async function recognizeLiveArrangementWindow(messages: ArrangementAiMessage[]) {
+async function recognizeLiveArrangementWindow(messages: ArrangementAiMessage[], userName?: string) {
   const apiKey = getStoredArrangementAiApiKey();
-  const cleanMessages = messages.filter((message) => message.content.trim()).slice(-8);
-  if (!apiKey || cleanMessages.length === 0) return;
+  const normalizedMessages = messages.filter((message) => message.content.trim());
+  const hasGroupMessages = normalizedMessages.some((message) => message.source === "group");
+  const cleanMessages = normalizedMessages.slice(hasGroupMessages ? -60 : -8);
+  if (!apiKey) {
+    writeArrangementAiStatus("未配置 DeepSeek API Key，发送后不会触发真实 AI 识别。");
+    return;
+  }
+  if (cleanMessages.length === 0) return;
 
   try {
+    writeArrangementAiStatus("正在调用 DeepSeek 识别安排...");
     const result = await extractArrangementsFromMessages(cleanMessages, {
       apiKey,
       model: defaultArrangementAiModel,
+      userName,
     });
     const currentTime = Date.now();
     result.candidates.forEach((candidate, index) => {
@@ -508,7 +524,15 @@ async function recognizeLiveArrangementWindow(messages: ArrangementAiMessage[]) 
         storeArrangementAiCandidate(candidate, currentTime + index);
       }
     });
-  } catch {
+    writeArrangementAiStatus(
+      result.candidates.length > 0
+        ? `DeepSeek 已返回 ${result.candidates.length} 条安排判别。`
+        : "DeepSeek 已调用成功，但未识别到需要并入的安排。"
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeArrangementAiStatus(`DeepSeek 调用失败：${message}`);
+    console.warn("DeepSeek arrangement recognition failed", error);
     // Chat sending should stay non-blocking when live AI is unavailable.
   }
 }
@@ -749,7 +773,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [sendToSelfTargetUid, setSendToSelfTargetUid] = React.useState<string | null>(null);
   const [activeTestIdentityId, setActiveTestIdentityId] = React.useState<string | null>(null);
   const [testConversationTargetUid, setTestConversationTargetUid] = React.useState<string | null>(null);
-  const [settingsView, setSettingsView] = React.useState<null | "settings" | "appearance" | "about">(
+  const [settingsView, setSettingsView] = React.useState<null | "settings" | "appearance" | "api" | "about">(
     null
   );
   const [searchQuery, setSearchQuery] = React.useState("");
@@ -1183,7 +1207,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     void recognizeLiveArrangementWindow([
       ...selfRecords.map((record) => selfRecordToAiMessage(record, arrangementSelfDisplayName)),
       selfRecordToAiMessage(nextRecord, arrangementSelfDisplayName),
-    ]);
+    ], arrangementSelfDisplayName);
   }, [arrangementSelfDisplayName, selfRecords]);
 
   const createRecordExtension = React.useCallback((parentRecord: RecordItem, content: string) => {
@@ -1461,7 +1485,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
         testRecordToAiMessage(record, summary, arrangementSelfDisplayName)
       ),
       testRecordToAiMessage(replyRecord, summary, arrangementSelfDisplayName),
-    ]);
+    ], arrangementSelfDisplayName);
   }, [arrangementSelfDisplayName, markTestConversationAsRead]);
 
   const openSourceConversation = React.useCallback(
@@ -1517,11 +1541,16 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <AboutScreen onBack={() => setSettingsView(null)} />;
     }
 
+    if (settingsView === "api") {
+      return <DeepSeekSettingsScreen onBack={() => setSettingsView("settings")} />;
+    }
+
     if (settingsView === "settings") {
       return (
         <SettingsScreen
           onBack={() => setSettingsView(null)}
           onOpenAppearance={() => setSettingsView("appearance")}
+          onOpenApi={() => setSettingsView("api")}
         />
       );
     }
@@ -3685,9 +3714,11 @@ function MineActionCard({
 function SettingsScreen({
   onBack,
   onOpenAppearance,
+  onOpenApi,
 }: {
   onBack: () => void;
   onOpenAppearance: () => void;
+  onOpenApi: () => void;
 }) {
   const { localeCode, resolvedLocale, t } = usePreferences();
   const [showLanguageSheet, setShowLanguageSheet] = React.useState(false);
@@ -3712,12 +3743,96 @@ function SettingsScreen({
             }`}
             onClick={() => setShowLanguageSheet(true)}
           />
+          <SettingsListItem
+            title="DeepSeek API"
+            description="配置 Key 后，发消息会自动识别安排并显示胶囊"
+            onClick={onOpenApi}
+          />
         </div>
       </div>
 
       {showLanguageSheet && (
         <LanguageSheet onClose={() => setShowLanguageSheet(false)} />
       )}
+    </div>
+  );
+}
+
+function DeepSeekSettingsScreen({ onBack }: { onBack: () => void }) {
+  const [apiKey, setApiKey] = React.useState(() => getStoredArrangementAiApiKey());
+  const [saved, setSaved] = React.useState(false);
+  const [status, setStatus] = React.useState(() =>
+    typeof window === "undefined"
+      ? ""
+      : window.localStorage.getItem(arrangementAiLastStatusStorageKey) ?? ""
+  );
+  const maskedKey = apiKey ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}` : "未配置";
+
+  React.useEffect(() => {
+    const syncStatus = () =>
+      setStatus(window.localStorage.getItem(arrangementAiLastStatusStorageKey) ?? "");
+    window.addEventListener(arrangementAiStatusEvent, syncStatus);
+    window.addEventListener("storage", syncStatus);
+    return () => {
+      window.removeEventListener(arrangementAiStatusEvent, syncStatus);
+      window.removeEventListener("storage", syncStatus);
+    };
+  }, []);
+
+  const saveApiKey = () => {
+    const normalizedKey = apiKey.trim();
+    if (normalizedKey) {
+      window.localStorage.setItem(arrangementAiApiKeyStorageKey, normalizedKey);
+      writeArrangementAiStatus("DeepSeek API Key 已保存，下一条消息会触发自动识别。");
+    } else {
+      window.localStorage.removeItem(arrangementAiApiKeyStorageKey);
+      writeArrangementAiStatus("DeepSeek API Key 已清空。");
+    }
+    setApiKey(normalizedKey);
+    setSaved(true);
+    window.setTimeout(() => setSaved(false), 1600);
+  };
+
+  return (
+    <div className="relative flex h-full flex-col bg-bg">
+      <MobilePageHeader title="DeepSeek API" onBack={onBack} />
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-2.5 py-3">
+        <section className="rounded-[12px] bg-surface p-3">
+          <label className="block text-sm font-medium leading-5 text-text">
+            API Key
+          </label>
+          <input
+            value={apiKey}
+            onChange={(event) => {
+              setApiKey(event.target.value);
+              setSaved(false);
+            }}
+            placeholder="sk-..."
+            type="password"
+            className="mt-2 h-11 w-full rounded-[10px] border border-border bg-fill px-3 text-sm text-text outline-none transition focus:border-primary"
+          />
+          <div className="mt-2 flex items-center justify-between gap-3">
+            <p className="min-w-0 truncate text-xs leading-5 text-text-tertiary">
+              当前：{maskedKey}
+            </p>
+            <button
+              type="button"
+              onClick={saveApiKey}
+              className="h-8 shrink-0 rounded-full bg-primary px-4 text-sm font-medium text-on-primary transition active:scale-[0.96]"
+            >
+              {saved ? "已保存" : "保存"}
+            </button>
+          </div>
+        </section>
+
+        <section className="mt-2.5 rounded-[12px] bg-surface p-3">
+          <h2 className="text-sm font-medium leading-5 text-text">识别状态</h2>
+          <p className="mt-1 text-sm leading-5 text-text-tertiary">
+            {status || "还没有触发过自动识别。"}
+          </p>
+        </section>
+      </div>
     </div>
   );
 }
